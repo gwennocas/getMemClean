@@ -1,40 +1,25 @@
-// getMemClean_tray.c - RAMMap-style memory cleaner that lives in the system tray
-//
-// Compile: gcc getMemClean_tray.c -o getMemClean_tray.exe -mwindows -lgdi32
-//          (-mwindows = no console window)
-//
-// First run:
-//   1) asks "Clean every how many seconds?" (plus the modes and a RAM limit)
-//      and saves the answers in getMemClean.ini (same folder as the .exe)
-//   2) asks if it should start with Windows and stay in the tray
-// Later: click the tray icon -> "Settings..." to change the answers.
-//
-// getMemClean.ini (shared with the console version, getMemClean.c):
-//     [getMemClean]
-//     modes=w          w = working sets, m = modified, t = standby, 0 = low-prio standby
-//     interval=10      seconds between cleanings (0 = automatic cleaning off)
-//     limit=0          only clean if RAM usage >= this % (0 = always)
-//
-// How it works:
-//   - Asks for administrator by itself (UAC) if you just double-click it.
-//   - Creates an INVISIBLE window, only to receive the tray icon and timer messages.
-//   - "Start with Windows" creates a SCHEDULED TASK with highest privileges.
-//     (the registry "Run" key does NOT work here: Windows does not start
-//      administrator programs from it without a UAC prompt, so it would never
-//      start by itself)
+// getMemClean_tray.c - Modern System Tray RAM Cleaning Utility
+// 
+// Compilation:
+//   gcc getMemClean_tray.c -o getMemClean_tray.exe -mwindows -lgdi32 -lcomctl32
+//   (-mwindows: hides the console window; -lcomctl32: links Windows Common Controls)
 
+#define _WIN32_WINNT 0x0601
 #include <windows.h>
+#include <commctrl.h>
 #include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 // ---------------------------------------------------------------------------
-// Part 1: the cleaning itself (same as getMemClean.c)
+// Part 1: Native Memory Cleaning Engine
 // ---------------------------------------------------------------------------
 
+// Function pointer signature for the undocumented Native API function in ntdll.dll
 typedef LONG (NTAPI *NtSetSystemInformation_t)(ULONG, PVOID, ULONG);
 
+// Constants corresponding to Windows memory management operations
 #define SystemMemoryListInformation 80
 #define MemoryEmptyWorkingSets             2
 #define MemoryFlushModifiedList            3
@@ -43,14 +28,19 @@ typedef LONG (NTAPI *NtSetSystemInformation_t)(ULONG, PVOID, ULONG);
 
 static NtSetSystemInformation_t NtSet;
 
+/**
+ * Enables a specific privilege for the current process token.
+ * Required to invoke low-level NT system functions.
+ */
 static BOOL enable_privilege(const char *name) {
     HANDLE token;
     TOKEN_PRIVILEGES tp;
 
-    if (!OpenProcessToken(GetCurrentProcess(),
-                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+    // Open process token with privileges adjustment rights
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
         return FALSE;
 
+    // Retrieve the Locally Unique Identifier (LUID) for the privilege name
     if (!LookupPrivilegeValueA(NULL, name, &tp.Privileges[0].Luid)) {
         CloseHandle(token);
         return FALSE;
@@ -59,13 +49,17 @@ static BOOL enable_privilege(const char *name) {
     tp.PrivilegeCount = 1;
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
+    // Apply the privilege modification
     AdjustTokenPrivileges(token, FALSE, &tp, 0, NULL, NULL);
-    DWORD err = GetLastError();   // read it right away, before any other Win32 call
+    DWORD err = GetLastError(); // Fetch error code immediately
     CloseHandle(token);
 
-    return err == ERROR_SUCCESS;  // ERROR_NOT_ALL_ASSIGNED = failed
+    return err == ERROR_SUCCESS; // Returns FALSE if ERROR_NOT_ALL_ASSIGNED
 }
 
+/**
+ * Retrieves current RAM usage percentage and available physical memory in MB.
+ */
 static void get_mem(DWORD *load, double *avail_mb) {
     MEMORYSTATUSEX m;
     m.dwLength = sizeof(m);
@@ -75,11 +69,12 @@ static void get_mem(DWORD *load, double *avail_mb) {
 }
 
 // ---------------------------------------------------------------------------
-// Part 2: program state
+// Part 2: Program State & Global Variables
 // ---------------------------------------------------------------------------
 
-#define WM_TRAY        (WM_APP + 1)   // message sent by the tray icon to our window
-#define ID_TIMER       1
+#define WM_TRAY        (WM_APP + 1)  // Custom window message for system tray events
+#define ID_TIMER       1             // Periodic cleaning timer ID
+#define ID_SETTINGS_TIMER 2          // Settings dialog live update timer ID
 #define ID_NOW         101
 #define ID_PAUSE       102
 #define ID_AUTOSTART   103
@@ -88,23 +83,26 @@ static void get_mem(DWORD *load, double *avail_mb) {
 #define TASK_NAME      "getMemClean"
 #define INI_SECTION    "getMemClean"
 
-static char  g_exe[MAX_PATH];         // full path of the .exe
-static char  g_dir[MAX_PATH];         // folder of the .exe
-static char  g_ini[MAX_PATH];         // full path of getMemClean.ini
-static char  g_modes[16]  = "w";
-static int   g_interval   = 10;
-static int   g_limit      = 0;
-static BOOL  g_paused     = FALSE;
-static BOOL  g_autostart  = FALSE;
+static char  g_exe[MAX_PATH];         // Executable path
+static char  g_dir[MAX_PATH];         // Application directory
+static char  g_ini[MAX_PATH];         // Path to getMemClean.ini
+static char  g_modes[16]  = "w";       // Configured cleaning modes
+static int   g_interval   = 10;        // Interval in seconds
+static int   g_limit      = 0;         // Minimum RAM threshold (%)
+static BOOL  g_paused     = FALSE;     // Pause toggle
+static BOOL  g_autostart  = FALSE;     // Autostart scheduled task status
 static char  g_status[96] = "Starting...";
-static UINT  g_wm_taskbar;            // "TaskbarCreated": Explorer broadcasts it when it restarts
-static HWND  g_hwnd;
-static NOTIFYICONDATAA g_nid;
+static UINT  g_wm_taskbar;            // "TaskbarCreated" message handle
+static HWND  g_hwnd;                  // Background window handle
+static NOTIFYICONDATAA g_nid;         // Tray icon notification data
 
 // ---------------------------------------------------------------------------
-// Part 3: settings file
+// Part 3: INI File Configuration Manager
 // ---------------------------------------------------------------------------
 
+/**
+ * Validates whether the given string contains only valid mode characters ('w', 'm', 't', '0').
+ */
 static BOOL valid_modes(const char *s) {
     if (*s == '\0') return FALSE;
     for (; *s; s++)
@@ -112,6 +110,9 @@ static BOOL valid_modes(const char *s) {
     return TRUE;
 }
 
+/**
+ * Loads user settings from getMemClean.ini. Applies safe fallback defaults.
+ */
 static void load_config(void) {
     char raw[64];
     GetPrivateProfileStringA(INI_SECTION, "modes", "w", raw, sizeof(raw), g_ini);
@@ -122,12 +123,17 @@ static void load_config(void) {
 
     g_interval = (int)GetPrivateProfileIntA(INI_SECTION, "interval", 10, g_ini);
     g_limit    = (int)GetPrivateProfileIntA(INI_SECTION, "limit",    0,  g_ini);
+    
+    // Clamp configuration boundaries
     if (g_interval < 0) g_interval = 0;
     if (g_interval > 86400) g_interval = 86400;
     if (g_limit < 0)   g_limit = 0;
     if (g_limit > 100) g_limit = 100;
 }
 
+/**
+ * Saves current runtime settings to getMemClean.ini.
+ */
 static BOOL save_config(void) {
     char num[16];
     BOOL ok = WritePrivateProfileStringA(INI_SECTION, "modes", g_modes, g_ini);
@@ -142,10 +148,12 @@ static BOOL save_config(void) {
 }
 
 // ---------------------------------------------------------------------------
-// Part 4: start with Windows (scheduled task)
+// Part 4: Windows Autostart via Task Scheduler
 // ---------------------------------------------------------------------------
 
-// Runs a command hidden (no window), waits, and returns its exit code
+/**
+ * Executes a process silently without showing a console window and awaits termination.
+ */
 static DWORD run_hidden(const char *cmdline) {
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
@@ -156,26 +164,29 @@ static DWORD run_hidden(const char *cmdline) {
     ZeroMemory(&pi, sizeof(pi));
     si.cb = sizeof(si);
 
-    snprintf(buf, sizeof(buf), "%s", cmdline);   // CreateProcess may change the buffer
+    snprintf(buf, sizeof(buf), "%s", cmdline);
 
-    if (CreateProcessA(NULL, buf, NULL, NULL, FALSE, CREATE_NO_WINDOW,
-                       NULL, NULL, &si, &pi)) {
-        WaitForSingleObject(pi.hProcess, 30000);
+    if (CreateProcessA(NULL, buf, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 30000); // 30-second execution timeout
         GetExitCodeProcess(pi.hProcess, &code);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     }
-    return code;   // 0 = success
+    return code; // 0 indicates successful command execution
 }
 
+/**
+ * Checks if the scheduled task already exists.
+ */
 static BOOL autostart_exists(void) {
     return run_hidden("schtasks /query /tn " TASK_NAME) == 0;
 }
 
+/**
+ * Creates an elevated Scheduled Task at user logon using PowerShell.
+ * (Bypasses Windows UAC limitations associated with traditional registry 'Run' keys).
+ */
 static BOOL autostart_enable(void) {
-    // Task: at logon, run this .exe with highest privileges (no UAC prompt),
-    // with no time limit (the Windows default would kill it after 3 days),
-    // also when running on battery.
     char cmd[2048];
     snprintf(cmd, sizeof(cmd),
         "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \""
@@ -191,88 +202,109 @@ static BOOL autostart_enable(void) {
     return run_hidden(cmd) == 0;
 }
 
+/**
+ * Removes the scheduled autostart task.
+ */
 static BOOL autostart_disable(void) {
     return run_hidden("schtasks /delete /tn " TASK_NAME " /f") == 0;
 }
 
 // ---------------------------------------------------------------------------
-// Part 5: the settings window ("Clean every how many seconds?")
+// Part 5: Settings GUI Window & Live Stats Panel
 // ---------------------------------------------------------------------------
 
 #define ID_ED_INTERVAL 201
 #define ID_ED_LIMIT    202
-#define ID_CK_BASE     210            // 210..213 = the four mode checkboxes
+#define ID_CK_BASE     210
+#define ID_LBL_STATS   220
 
-static const char  MODE_CHARS[4]     = { 'w', 'm', 't', '0' };
-static const char *MODE_LABELS[4]    = { "Working sets (w)", "Modified list (m)",
-                                         "Standby list (t)", "Low-priority standby (0)" };
+static const char  MODE_CHARS[4]  = { 'w', 'm', 't', '0' };
+static const char *MODE_LABELS[4] = { 
+    "Working sets (w)", 
+    "Modified list (m)",
+    "Standby list (t)", 
+    "Low-priority standby (0)" 
+};
 
-static HWND s_dlg, s_ed_interval, s_ed_limit, s_ck[4];
+static HWND s_dlg, s_ed_interval, s_ed_limit, s_ck[4], s_lbl_stats;
 static BOOL s_done, s_saved;
 
-static HWND make_child(HWND parent, const char *cls, const char *text,
-                       DWORD style, DWORD exstyle,
-                       int x, int y, int w, int h, int id) {
-    HWND c = CreateWindowExA(exstyle, cls, text, WS_CHILD | WS_VISIBLE | style,
-                             x, y, w, h, parent, (HMENU)(INT_PTR)id,
-                             GetModuleHandleA(NULL), NULL);
+/**
+ * Helper function to create child controls with standard modern font applied.
+ */
+static HWND make_child(HWND parent, const char *cls, const char *text, DWORD style, DWORD exstyle, int x, int y, int w, int h, int id) {
+    HWND c = CreateWindowExA(exstyle, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, parent, (HMENU)(INT_PTR)id, GetModuleHandleA(NULL), NULL);
     SendMessageA(c, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
     return c;
 }
 
-// Reads a whole number between 0 and max from an edit box
+/**
+ * Parses integers from text fields and performs range validation.
+ */
 static BOOL read_int_field(HWND ed, int max, int *out) {
     char buf[32];
     GetWindowTextA(ed, buf, sizeof(buf));
-
     char *end;
     long v = strtol(buf, &end, 10);
     while (*end == ' ') end++;
-    if (end == buf || *end != '\0' || v < 0 || v > max)
-        return FALSE;
-
+    if (end == buf || *end != '\0' || v < 0 || v > max) return FALSE;
     *out = (int)v;
     return TRUE;
 }
 
+/**
+ * Updates memory usage info in the live display header of the settings dialog.
+ */
+static void update_dialog_stats(void) {
+    if (!s_lbl_stats || !IsWindow(s_lbl_stats)) return;
+    DWORD load;
+    double avail;
+    get_mem(&load, &avail);
+    char buf[128];
+    snprintf(buf, sizeof(buf), "RAM Usage: %lu%%  |  Available: %.1f GB", (unsigned long)load, avail / 1024.0);
+    SetWindowTextA(s_lbl_stats, buf);
+}
+
+/**
+ * Window procedure for the Settings dialog window.
+ */
 static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_CREATE: {
             char num[16];
 
-            make_child(hwnd, "STATIC",
-                       "Clean every how many seconds?  (0 = off, use \"Clean now\")",
-                       0, 0, 16, 16, 308, 18, -1);
-            snprintf(num, sizeof(num), "%d", g_interval);
-            s_ed_interval = make_child(hwnd, "EDIT", num,
-                                       ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP,
-                                       WS_EX_CLIENTEDGE, 16, 38, 80, 24, ID_ED_INTERVAL);
+            // Live RAM stats panel
+            s_lbl_stats = make_child(hwnd, "STATIC", "Loading memory stats...", SS_CENTERIMAGE, WS_EX_CLIENTEDGE, 16, 16, 388, 30, ID_LBL_STATS);
+            update_dialog_stats();
+            SetTimer(hwnd, ID_SETTINGS_TIMER, 1000, NULL); // Refresh stats every second
 
-            make_child(hwnd, "STATIC", "Modes:", 0, 0, 16, 78, 308, 18, -1);
+            make_child(hwnd, "STATIC", "Clean interval in seconds (0 = manual cleaning only):", 0, 0, 16, 62, 388, 18, -1);
+            snprintf(num, sizeof(num), "%d", g_interval);
+            s_ed_interval = make_child(hwnd, "EDIT", num, ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 16, 82, 100, 24, ID_ED_INTERVAL);
+
+            make_child(hwnd, "STATIC", "Memory Cleaning Modes:", 0, 0, 16, 120, 388, 18, -1);
             for (int i = 0; i < 4; i++) {
-                int x = 16 + (i % 2) * 160;
-                int y = 98 + (i / 2) * 24;
-                s_ck[i] = make_child(hwnd, "BUTTON", MODE_LABELS[i],
-                                     BS_AUTOCHECKBOX | WS_TABSTOP, 0,
-                                     x, y, 156, 20, ID_CK_BASE + i);
+                int y = 142 + (i * 24);
+                s_ck[i] = make_child(hwnd, "BUTTON", MODE_LABELS[i], BS_AUTOCHECKBOX | WS_TABSTOP, 0, 16, y, 388, 20, ID_CK_BASE + i);
                 if (strchr(g_modes, MODE_CHARS[i]))
                     SendMessageA(s_ck[i], BM_SETCHECK, BST_CHECKED, 0);
             }
 
-            make_child(hwnd, "STATIC",
-                       "Only clean if RAM usage is at least (%)  (0 = always)",
-                       0, 0, 16, 156, 308, 18, -1);
+            make_child(hwnd, "STATIC", "Only clean if RAM usage is at least (%) (0 = always):", 0, 0, 16, 246, 388, 18, -1);
             snprintf(num, sizeof(num), "%d", g_limit);
-            s_ed_limit = make_child(hwnd, "EDIT", num,
-                                    ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP,
-                                    WS_EX_CLIENTEDGE, 16, 178, 80, 24, ID_ED_LIMIT);
+            s_ed_limit = make_child(hwnd, "EDIT", num, ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 16, 268, 100, 24, ID_ED_LIMIT);
 
-            make_child(hwnd, "BUTTON", "Save",   BS_DEFPUSHBUTTON | WS_TABSTOP, 0,
-                       160, 214, 76, 26, IDOK);
-            make_child(hwnd, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, 0,
-                       244, 214, 76, 26, IDCANCEL);
+            // Action buttons
+            make_child(hwnd, "BUTTON", "Save", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 228, 312, 84, 28, IDOK);
+            make_child(hwnd, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, 0, 320, 312, 84, 28, IDCANCEL);
             return 0;
         }
+
+        case WM_TIMER:
+            if (wp == ID_SETTINGS_TIMER) {
+                update_dialog_stats();
+            }
+            return 0;
 
         case WM_COMMAND:
             if (LOWORD(wp) == IDOK) {
@@ -280,14 +312,12 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 char modes[8];
 
                 if (!read_int_field(s_ed_interval, 86400, &interval)) {
-                    MessageBoxA(hwnd, "Please type a number of seconds from 0 to 86400.",
-                                "getMemClean", MB_ICONWARNING);
+                    MessageBoxA(hwnd, "Please enter a valid interval between 0 and 86400 seconds.", "getMemClean", MB_ICONWARNING);
                     SetFocus(s_ed_interval);
                     return 0;
                 }
                 if (!read_int_field(s_ed_limit, 100, &limit)) {
-                    MessageBoxA(hwnd, "Please type a RAM usage from 0 to 100.",
-                                "getMemClean", MB_ICONWARNING);
+                    MessageBoxA(hwnd, "Please enter a valid memory limit percentage (0 to 100).", "getMemClean", MB_ICONWARNING);
                     SetFocus(s_ed_limit);
                     return 0;
                 }
@@ -296,8 +326,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                         modes[n++] = MODE_CHARS[i];
                 modes[n] = '\0';
                 if (n == 0) {
-                    MessageBoxA(hwnd, "Pick at least one mode.",
-                                "getMemClean", MB_ICONWARNING);
+                    MessageBoxA(hwnd, "Please select at least one cleaning mode.", "getMemClean", MB_ICONWARNING);
                     return 0;
                 }
 
@@ -305,17 +334,17 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 g_limit    = limit;
                 snprintf(g_modes, sizeof(g_modes), "%s", modes);
                 if (!save_config())
-                    MessageBoxA(hwnd, "Could not save getMemClean.ini (is the folder read-only?).\n"
-                                      "The new settings work until you close the program.",
-                                "getMemClean", MB_ICONWARNING);
+                    MessageBoxA(hwnd, "Could not save settings to getMemClean.ini.", "getMemClean", MB_ICONWARNING);
 
                 s_saved = TRUE;
                 s_done  = TRUE;
+                KillTimer(hwnd, ID_SETTINGS_TIMER);
                 DestroyWindow(hwnd);
                 return 0;
             }
             if (LOWORD(wp) == IDCANCEL) {
                 s_done = TRUE;
+                KillTimer(hwnd, ID_SETTINGS_TIMER);
                 DestroyWindow(hwnd);
                 return 0;
             }
@@ -323,19 +352,20 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
 
         case WM_CLOSE:
             s_done = TRUE;
+            KillTimer(hwnd, ID_SETTINGS_TIMER);
             DestroyWindow(hwnd);
             return 0;
     }
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
-// Shows the settings window and waits until it is closed.
-// Returns TRUE if the user pressed Save.
+/**
+ * Creates and shows the Settings dialog modal window.
+ */
 static BOOL show_settings(const char *title) {
     static BOOL registered = FALSE;
     HINSTANCE hi = GetModuleHandleA(NULL);
 
-    // already open (clicked the menu twice): just bring it to the front
     if (s_dlg && IsWindow(s_dlg)) {
         SetForegroundWindow(s_dlg);
         return FALSE;
@@ -348,15 +378,14 @@ static BOOL show_settings(const char *title) {
         wc.hInstance     = hi;
         wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
         wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-        wc.lpszClassName = "GetMemCleanSettings";
+        wc.lpszClassName = "GetMemCleanSettingsModern";
         RegisterClassA(&wc);
         registered = TRUE;
     }
 
-    // outer window size that gives us a 340x254 client area
     DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     DWORD ex    = WS_EX_DLGMODALFRAME | WS_EX_TOPMOST;
-    RECT r = { 0, 0, 340, 254 };
+    RECT r = { 0, 0, 420, 360 };
     AdjustWindowRectEx(&r, style, FALSE, ex);
     int w = r.right - r.left;
     int h = r.bottom - r.top;
@@ -365,22 +394,20 @@ static BOOL show_settings(const char *title) {
 
     s_done  = FALSE;
     s_saved = FALSE;
-    s_dlg = CreateWindowExA(ex, "GetMemCleanSettings", title, style,
-                            x, y, w, h, NULL, NULL, hi, NULL);
+    s_dlg = CreateWindowExA(ex, "GetMemCleanSettingsModern", title, style, x, y, w, h, NULL, NULL, hi, NULL);
     if (!s_dlg) return FALSE;
 
     ShowWindow(s_dlg, SW_SHOW);
     SetForegroundWindow(s_dlg);
     SetFocus(s_ed_interval);
-    SendMessageA(s_ed_interval, EM_SETSEL, 0, -1);   // select the number, so typing replaces it
+    SendMessageA(s_ed_interval, EM_SETSEL, 0, -1);
 
-    // Our own little message loop, until the window closes.
-    // IsDialogMessage gives us Tab, Enter (= Save) and Esc (= Cancel).
+    // Dialog modal message loop with keyboard accelerator support (Tab, Enter, Esc)
     MSG m;
     while (!s_done) {
         BOOL got = GetMessageA(&m, NULL, 0, 0);
-        if (got <= 0) {                  // WM_QUIT arrived (user clicked Exit)
-            PostQuitMessage((int)m.wParam);   // pass it on, so the main loop also ends
+        if (got <= 0) {
+            PostQuitMessage((int)m.wParam);
             break;
         }
         if (!IsDialogMessageA(s_dlg, &m)) {
@@ -395,23 +422,41 @@ static BOOL show_settings(const char *title) {
 }
 
 // ---------------------------------------------------------------------------
-// Part 6: tray icon
+// Part 6: System Tray Icon & Notifications
 // ---------------------------------------------------------------------------
 
-// Text shown when the mouse hovers over the icon
+/**
+ * Updates the tray icon hover tooltip text.
+ */
 static void update_tip(void) {
-    snprintf(g_nid.szTip, sizeof(g_nid.szTip), "getMemClean%s - %s",
-             g_paused ? " (paused)" : "", g_status);
+    snprintf(g_nid.szTip, sizeof(g_nid.szTip), "getMemClean%s\n%s", g_paused ? " [Paused]" : "", g_status);
     Shell_NotifyIconA(NIM_MODIFY, &g_nid);
 }
 
-static void set_idle_status(void) {
-    if (g_interval > 0)
-        snprintf(g_status, sizeof(g_status), "every %ds, modes %s", g_interval, g_modes);
-    else
-        snprintf(g_status, sizeof(g_status), "automatic cleaning off");
+/**
+ * Displays a popup balloon notification from the tray icon.
+ */
+static void show_notification(const char *title, const char *msg) {
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_INFO;
+    snprintf(g_nid.szInfoTitle, sizeof(g_nid.szInfoTitle), "%s", title);
+    snprintf(g_nid.szInfo, sizeof(g_nid.szInfo), "%s", msg);
+    g_nid.dwInfoFlags = NIIF_INFO;
+    Shell_NotifyIconA(NIM_MODIFY, &g_nid);
 }
 
+/**
+ * Resets status text based on current schedule settings.
+ */
+static void set_idle_status(void) {
+    if (g_interval > 0)
+        snprintf(g_status, sizeof(g_status), "Every %ds | Modes: %s", g_interval, g_modes);
+    else
+        snprintf(g_status, sizeof(g_status), "Automatic cleaning disabled");
+}
+
+/**
+ * Registers the application icon in the Windows notification tray.
+ */
 static void add_tray_icon(void) {
     ZeroMemory(&g_nid, sizeof(g_nid));
     g_nid.cbSize           = sizeof(g_nid);
@@ -419,48 +464,57 @@ static void add_tray_icon(void) {
     g_nid.uID              = 1;
     g_nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
-    g_nid.hIcon            = LoadIcon(NULL, IDI_APPLICATION);   // default Windows icon
+    g_nid.hIcon            = LoadIcon(NULL, IDI_APPLICATION);
     snprintf(g_nid.szTip, sizeof(g_nid.szTip), "getMemClean - %s", g_status);
     Shell_NotifyIconA(NIM_ADD, &g_nid);
 }
 
+/**
+ * Displays the right-click context menu at the mouse cursor position.
+ */
 static void show_menu(void) {
     POINT pt;
     GetCursorPos(&pt);
 
     HMENU m = CreatePopupMenu();
-    AppendMenuA(m, MF_STRING, ID_NOW, "Clean now");
-    AppendMenuA(m, MF_STRING | (g_paused ? MF_CHECKED : 0), ID_PAUSE, "Pause automatic cleaning");
+    AppendMenuA(m, MF_STRING, ID_NOW, "Clean memory now");
+    AppendMenuA(m, MF_STRING | (g_paused ? MF_CHECKED : 0), ID_PAUSE, "Pause auto-cleaning");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, ID_SETTINGS, "Settings...");
     AppendMenuA(m, MF_STRING | (g_autostart ? MF_CHECKED : 0), ID_AUTOSTART, "Start with Windows");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, ID_EXIT, "Exit");
 
-    SetForegroundWindow(g_hwnd);   // without this the menu does not close when you click outside
+    // Required workaround to properly handle popup menu dismissal when clicking outside
+    SetForegroundWindow(g_hwnd);
     TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, g_hwnd, NULL);
-    PostMessageA(g_hwnd, WM_NULL, 0, 0);   // pair of SetForegroundWindow (Microsoft's recipe)
+    PostMessageA(g_hwnd, WM_NULL, 0, 0);
     DestroyMenu(m);
 }
 
 // ---------------------------------------------------------------------------
-// Part 7: one cleaning cycle
+// Part 7: Memory Cleaning Cycle Execution
 // ---------------------------------------------------------------------------
 
+/**
+ * Performs a memory cleaning routine.
+ * @param forced - If TRUE, ignores RAM threshold limit checks.
+ */
 static void do_clean(BOOL forced) {
     DWORD load_before, load_after;
     double avail_before, avail_after;
 
     get_mem(&load_before, &avail_before);
 
+    // Skip auto-cleaning cycle if RAM load is below threshold
     if (!forced && (int)load_before < g_limit) {
-        snprintf(g_status, sizeof(g_status), "usage %lu%% < limit %d%%",
-                 (unsigned long)load_before, g_limit);
+        snprintf(g_status, sizeof(g_status), "Load %lu%% < Limit %d%%", (unsigned long)load_before, g_limit);
         update_tip();
         return;
     }
 
     LONG failed = 0;
+    // Iterate through configured mode characters ('w', 'm', 't', '0')
     for (const char *p = g_modes; *p; p++) {
         int cmd = 0;
         switch (*p) {
@@ -473,17 +527,25 @@ static void do_clean(BOOL forced) {
         if (status != 0) failed = status;
     }
 
-    Sleep(300);   // let Windows settle the numbers
+    Sleep(300); // Allow Windows kernel memory statistics to settle
     get_mem(&load_after, &avail_after);
 
-    if (failed)
-        snprintf(g_status, sizeof(g_status), "error 0x%08lX", (unsigned long)failed);
-    else
-        snprintf(g_status, sizeof(g_status), "available: %.0f -> %.0f MB",
-                 avail_before, avail_after);
+    if (failed) {
+        snprintf(g_status, sizeof(g_status), "Error 0x%08lX", (unsigned long)failed);
+    } else {
+        snprintf(g_status, sizeof(g_status), "Available: %.0f -> %.0f MB", avail_before, avail_after);
+        if (forced) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Memory cleaned successfully!\nBefore: %.0f MB | After: %.0f MB", avail_before, avail_after);
+            show_notification("getMemClean - Manual Clean", msg);
+        }
+    }
     update_tip();
 }
 
+/**
+ * Resets or updates the background interval timer.
+ */
 static void restart_timer(void) {
     KillTimer(g_hwnd, ID_TIMER);
     if (g_interval > 0)
@@ -491,11 +553,11 @@ static void restart_timer(void) {
 }
 
 // ---------------------------------------------------------------------------
-// Part 8: the invisible window (receives all the messages)
+// Part 8: Invisible Message-Handling Window Procedure
 // ---------------------------------------------------------------------------
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    // Explorer restarted and wiped the tray icons: put ours back
+    // Restore system tray icon if Windows Explorer restarts
     if (msg == g_wm_taskbar) {
         Shell_NotifyIconA(NIM_ADD, &g_nid);
         return 0;
@@ -506,7 +568,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!g_paused) do_clean(FALSE);
             return 0;
 
-        case WM_TRAY:   // click on the tray icon
+        case WM_TRAY:
             if (lp == WM_RBUTTONUP || lp == WM_LBUTTONUP)
                 show_menu();
             return 0;
@@ -523,7 +585,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     break;
 
                 case ID_SETTINGS:
-                    if (show_settings("getMemClean settings")) {
+                    if (show_settings("getMemClean - Settings")) {
                         restart_timer();
                         set_idle_status();
                         update_tip();
@@ -533,12 +595,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case ID_AUTOSTART:
                     if (g_autostart) {
                         if (autostart_disable()) g_autostart = FALSE;
-                        else MessageBoxA(hwnd, "Could not remove the scheduled task.",
-                                         "getMemClean", MB_ICONERROR);
+                        else MessageBoxA(hwnd, "Failed to delete scheduled task.", "getMemClean", MB_ICONERROR);
                     } else {
                         if (autostart_enable()) g_autostart = TRUE;
-                        else MessageBoxA(hwnd, "Could not create the scheduled task.",
-                                         "getMemClean", MB_ICONERROR);
+                        else MessageBoxA(hwnd, "Failed to create scheduled task.", "getMemClean", MB_ICONERROR);
                     }
                     break;
 
@@ -558,91 +618,89 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // ---------------------------------------------------------------------------
-// Part 9: WinMain (no console, so no plain main)
+// Part 9: Application Entry Point (WinMain)
 // ---------------------------------------------------------------------------
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show) {
     (void)hPrev; (void)show;
 
-    // Paths: .exe, its folder, and getMemClean.ini
+    // Enable Windows visual styles (ComCtl32 v6)
+    INITCOMMONCONTROLSEX icce;
+    icce.dwSize = sizeof(icce);
+    icce.dwICC = ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES;
+    InitCommonControlsEx(&icce);
+
+    // Resolve current executable path and working directory
     GetModuleFileNameA(NULL, g_exe, MAX_PATH);
     snprintf(g_dir, sizeof(g_dir), "%s", g_exe);
     char *slash = strrchr(g_dir, '\\');
     if (slash) *slash = '\0';
     snprintf(g_ini, sizeof(g_ini), "%s\\getMemClean.ini", g_dir);
 
-    // 1) Must be administrator. If not, ask for UAC and reopen elevated.
-    //    The --elevated argument prevents reopening in a loop if something goes wrong.
+    // Ensure elevated administrative privileges via UAC prompt if needed
     if (!enable_privilege("SeProfileSingleProcessPrivilege")) {
         if (strstr(cmdline, "--elevated")) {
-            MessageBoxA(NULL, "Could not get the required privilege. "
-                              "Your account must be an administrator.",
-                        "getMemClean", MB_ICONERROR);
+            MessageBoxA(NULL, "Insufficient privileges. Your account must be an Administrator.", "getMemClean", MB_ICONERROR);
             return 1;
         }
         HINSTANCE r = ShellExecuteA(NULL, "runas", g_exe, "--elevated", g_dir, SW_SHOWNORMAL);
         if ((INT_PTR)r <= 32)
-            MessageBoxA(NULL, "getMemClean needs administrator rights to work.",
-                        "getMemClean", MB_ICONWARNING);
+            MessageBoxA(NULL, "getMemClean requires administrator rights to function.", "getMemClean", MB_ICONWARNING);
         return 0;
     }
 
-    // 2) Only one copy at a time (autostart + opening it by hand won't duplicate)
-    HANDLE mutex = CreateMutexA(NULL, FALSE, "Local\\getMemClean_single_instance");
-    if (GetLastError() == ERROR_ALREADY_EXISTS)
-        return 0;
+    // Single-instance enforcement using a named system mutex
+    HANDLE mutex = CreateMutexA(NULL, FALSE, "Local\\getMemClean_single_instance_modern");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
-    // 3) Resolve the undocumented NT kernel function from ntdll
-    NtSet = (NtSetSystemInformation_t)GetProcAddress(
-                GetModuleHandleA("ntdll.dll"), "NtSetSystemInformation");
+    // Load NtSetSystemInformation dynamically from ntdll.dll
+    NtSet = (NtSetSystemInformation_t)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetSystemInformation");
     if (NtSet == NULL) {
-        MessageBoxA(NULL, "Could not find NtSetSystemInformation in ntdll.",
-                    "getMemClean", MB_ICONERROR);
+        MessageBoxA(NULL, "Could not locate NtSetSystemInformation in ntdll.dll.", "getMemClean", MB_ICONERROR);
         return 1;
     }
 
-    // 4) Settings. If getMemClean.ini does not exist yet, this is the first run.
     BOOL first = (GetFileAttributesA(g_ini) == INVALID_FILE_ATTRIBUTES);
-    load_config();                  // defaults if there is no file
+    load_config();
     g_autostart = autostart_exists();
 
+    // First-time configuration setup
     if (first) {
-        save_config();              // so it only asks once, even if you press Cancel
-        show_settings("getMemClean - first run");   // "how many seconds?"
+        save_config();
+        show_settings("getMemClean - First Run Setup");
 
         if (!g_autostart) {
             int r = MessageBoxA(NULL,
-                "Do you want getMemClean to start with Windows and stay in the tray?\n\n"
-                "You can change this later in the tray icon menu.",
+                "Would you like getMemClean to start automatically with Windows?\n\n"
+                "You can change this anytime from the system tray menu.",
                 "getMemClean", MB_YESNO | MB_ICONQUESTION);
             if (r == IDYES) {
                 if (autostart_enable()) g_autostart = TRUE;
-                else MessageBoxA(NULL, "Could not create the scheduled task.",
-                                 "getMemClean", MB_ICONERROR);
+                else MessageBoxA(NULL, "Could not enable autostart task.", "getMemClean", MB_ICONERROR);
             }
         }
     }
 
-    // 5) Invisible window (we never call ShowWindow on it)
+    // Register TaskbarCreated message to handle Explorer shell restarts
     g_wm_taskbar = RegisterWindowMessageA("TaskbarCreated");
 
+    // Register background host window class
     WNDCLASSA wc;
     ZeroMemory(&wc, sizeof(wc));
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = hInst;
-    wc.lpszClassName = "GetMemCleanWindow";
+    wc.lpszClassName = "GetMemCleanWindowModern";
     RegisterClassA(&wc);
 
-    g_hwnd = CreateWindowExA(0, "GetMemCleanWindow", "getMemClean", 0,
-                             0, 0, 0, 0, NULL, NULL, hInst, NULL);
+    // Create hidden message-receiver window
+    g_hwnd = CreateWindowExA(0, "GetMemCleanWindowModern", "getMemClean", 0, 0, 0, 0, 0, NULL, NULL, hInst, NULL);
     if (!g_hwnd) return 1;
 
-    // 6) Icon + timer
     set_idle_status();
     add_tray_icon();
     restart_timer();
 
-    // 7) Message loop: the program stays here until you click "Exit"
+    // Main Win32 application message loop
     MSG m;
     while (GetMessageA(&m, NULL, 0, 0) > 0) {
         TranslateMessage(&m);
