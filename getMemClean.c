@@ -1,8 +1,7 @@
-// getMemClean_tray.c - Modern System Tray RAM Cleaning Utility
+// getMemClean.c - Native system-tray memory utility
 // 
 // Compilation:
-//   gcc getMemClean_tray.c -o getMemClean_tray.exe -mwindows -lgdi32 -lcomctl32
-//   (-mwindows: hides the console window; -lcomctl32: links Windows Common Controls)
+//   gcc getMemClean.c watchdog.c -o getMemClean.exe -mwindows -lgdi32 -lcomctl32 -lpsapi
 
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
@@ -11,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "watchdog.h"
 
 // ---------------------------------------------------------------------------
 // Part 1: Native Memory Cleaning Engine
@@ -75,6 +75,7 @@ static void get_mem(DWORD *load, double *avail_mb) {
 #define WM_TRAY        (WM_APP + 1)  // Custom window message for system tray events
 #define ID_TIMER       1             // Periodic cleaning timer ID
 #define ID_SETTINGS_TIMER 2          // Settings dialog live update timer ID
+#define WM_WATCH_NEXT (WM_APP + 11)
 #define ID_NOW         101
 #define ID_PAUSE       102
 #define ID_AUTOSTART   103
@@ -217,6 +218,15 @@ static BOOL autostart_disable(void) {
 #define ID_ED_LIMIT    202
 #define ID_CK_BASE     210
 #define ID_LBL_STATS   220
+#define ID_WATCH_ENABLED 230
+#define ID_WATCH_INTERVAL 231
+#define ID_WATCH_GLOBAL 232
+#define ID_WATCH_RULES 233
+#define ID_WATCH_IGNORED 234
+#define ID_ALERT_TRIM 240
+#define ID_ALERT_END 241
+#define ID_ALERT_IGNORE 242
+#define ID_ALERT_FOREVER 243
 
 static const char  MODE_CHARS[4]  = { 'w', 'm', 't', '0' };
 static const char *MODE_LABELS[4] = { 
@@ -227,7 +237,11 @@ static const char *MODE_LABELS[4] = {
 };
 
 static HWND s_dlg, s_ed_interval, s_ed_limit, s_ck[4], s_lbl_stats;
+static HWND s_w_enabled, s_w_interval, s_w_global, s_w_rules, s_w_ignored;
 static BOOL s_done, s_saved;
+static HWND s_alert_window;
+static WatchAlert *s_alert_queue[8];
+static unsigned s_alert_count;
 
 /**
  * Helper function to create child controls with standard modern font applied.
@@ -294,9 +308,27 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             snprintf(num, sizeof(num), "%d", g_limit);
             s_ed_limit = make_child(hwnd, "EDIT", num, ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 16, 268, 100, 24, ID_ED_LIMIT);
 
+            WatchConfig cfg;
+            char rules[32768], ignored[32768];
+            watch_get_config(&cfg);
+            s_w_enabled = make_child(hwnd, "BUTTON", "Enable Memory Watchdog", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 16, 306, 388, 20, ID_WATCH_ENABLED);
+            SendMessageA(s_w_enabled, BM_SETCHECK, cfg.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+            make_child(hwnd, "STATIC", "Scan every (seconds, 5-3600):", 0, 0, 16, 336, 190, 18, -1);
+            snprintf(num, sizeof(num), "%u", cfg.interval_sec);
+            s_w_interval = make_child(hwnd, "EDIT", num, ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 214, 332, 70, 24, ID_WATCH_INTERVAL);
+            make_child(hwnd, "STATIC", "Private Bytes limit (MB, 0 = per-process only):", 0, 0, 16, 366, 300, 18, -1);
+            snprintf(num, sizeof(num), "%u", cfg.global_mb);
+            s_w_global = make_child(hwnd, "EDIT", num, ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 318, 362, 86, 24, ID_WATCH_GLOBAL);
+            make_child(hwnd, "STATIC", "Per-process limits (one app.exe=MB per line):", 0, 0, 16, 394, 388, 18, -1);
+            watch_format_rules(&cfg, rules, sizeof(rules));
+            s_w_rules = make_child(hwnd, "EDIT", rules, ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 16, 414, 388, 72, ID_WATCH_RULES);
+            make_child(hwnd, "STATIC", "Permanently ignored (one app.exe per line):", 0, 0, 16, 492, 388, 18, -1);
+            watch_format_ignored(&cfg, ignored, sizeof(ignored));
+            s_w_ignored = make_child(hwnd, "EDIT", ignored, ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 16, 512, 388, 56, ID_WATCH_IGNORED);
+
             // Action buttons
-            make_child(hwnd, "BUTTON", "Save", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 228, 312, 84, 28, IDOK);
-            make_child(hwnd, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, 0, 320, 312, 84, 28, IDCANCEL);
+            make_child(hwnd, "BUTTON", "Save", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 228, 580, 84, 28, IDOK);
+            make_child(hwnd, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, 0, 320, 580, 84, 28, IDCANCEL);
             return 0;
         }
 
@@ -308,8 +340,10 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
 
         case WM_COMMAND:
             if (LOWORD(wp) == IDOK) {
-                int interval, limit, n = 0;
+                int interval, limit, watch_interval, global_mb, n = 0;
                 char modes[8];
+                char rules[32768], ignored[32768];
+                WatchConfig cfg;
 
                 if (!read_int_field(s_ed_interval, 86400, &interval)) {
                     MessageBoxA(hwnd, "Please enter a valid interval between 0 and 86400 seconds.", "getMemClean", MB_ICONWARNING);
@@ -319,6 +353,21 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 if (!read_int_field(s_ed_limit, 100, &limit)) {
                     MessageBoxA(hwnd, "Please enter a valid memory limit percentage (0 to 100).", "getMemClean", MB_ICONWARNING);
                     SetFocus(s_ed_limit);
+                    return 0;
+                }
+                if (!read_int_field(s_w_interval, 3600, &watch_interval) || watch_interval < 5 ||
+                    !read_int_field(s_w_global, 1048576, &global_mb)) {
+                    MessageBoxA(hwnd, "Watchdog interval must be 5-3600 seconds and limit 0-1048576 MB.", "getMemClean", MB_ICONWARNING);
+                    return 0;
+                }
+                watch_get_config(&cfg);
+                cfg.enabled = SendMessageA(s_w_enabled, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                cfg.interval_sec = (unsigned)watch_interval;
+                cfg.global_mb = (unsigned)global_mb;
+                GetWindowTextA(s_w_rules, rules, sizeof(rules));
+                GetWindowTextA(s_w_ignored, ignored, sizeof(ignored));
+                if (!watch_parse_rules(rules, &cfg) || !watch_parse_ignored(ignored, &cfg)) {
+                    MessageBoxA(hwnd, "Use app.exe=MB for limits and app.exe for ignored applications; one per line, no duplicates.", "getMemClean", MB_ICONWARNING);
                     return 0;
                 }
                 for (int i = 0; i < 4; i++)
@@ -333,7 +382,10 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 g_interval = interval;
                 g_limit    = limit;
                 snprintf(g_modes, sizeof(g_modes), "%s", modes);
-                if (!save_config())
+                watch_set_config(&cfg);
+                BOOL clean_saved = save_config();
+                BOOL watch_saved = watch_save_config();
+                if (!clean_saved || !watch_saved)
                     MessageBoxA(hwnd, "Could not save settings to getMemClean.ini.", "getMemClean", MB_ICONWARNING);
 
                 s_saved = TRUE;
@@ -385,7 +437,7 @@ static BOOL show_settings(const char *title) {
 
     DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     DWORD ex    = WS_EX_DLGMODALFRAME | WS_EX_TOPMOST;
-    RECT r = { 0, 0, 420, 360 };
+    RECT r = { 0, 0, 420, 620 };
     AdjustWindowRectEx(&r, style, FALSE, ex);
     int w = r.right - r.left;
     int h = r.bottom - r.top;
@@ -419,6 +471,112 @@ static BOOL show_settings(const char *title) {
     if (IsWindow(s_dlg)) DestroyWindow(s_dlg);
     s_dlg = NULL;
     return s_saved;
+}
+
+/* Watchdog notifications are ordinary Win32 windows; all creation and button
+   handling stays on the UI thread. The worker only posts alert data. */
+static void show_next_watch_alert(void);
+
+static LRESULT CALLBACK WatchAlertProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    WatchAlert *a = (WatchAlert *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+    switch (msg) {
+        case WM_CREATE: {
+            CREATESTRUCTA *cs = (CREATESTRUCTA *)lp;
+            char line[512];
+            a = (WatchAlert *)cs->lpCreateParams;
+            SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)a);
+            watch_format_alert(a, line, sizeof(line));
+            make_child(hwnd, "STATIC", line, 0, 0, 14, 12, 370, 96, -1);
+            make_child(hwnd, "STATIC", "Trimming may be temporary and does not fix a leak.", 0, 0, 14, 111, 370, 20, -1);
+            make_child(hwnd, "BUTTON", "Trim RAM", BS_PUSHBUTTON | WS_TABSTOP, 0, 14, 145, 112, 28, ID_ALERT_TRIM);
+            make_child(hwnd, "BUTTON", "End process", BS_PUSHBUTTON | WS_TABSTOP, 0, 136, 145, 112, 28, ID_ALERT_END);
+            make_child(hwnd, "BUTTON", "Ignore", BS_PUSHBUTTON | WS_TABSTOP, 0, 258, 145, 112, 28, ID_ALERT_IGNORE);
+            make_child(hwnd, "BUTTON", "Always ignore this app", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 14, 184, 360, 20, ID_ALERT_FOREVER);
+            return 0;
+        }
+        case WM_COMMAND:
+            if (!a) break;
+            if (LOWORD(wp) == ID_ALERT_TRIM) {
+                DWORD error = watch_trim(a);
+                if (error) {
+                    char text[160];
+                    snprintf(text, sizeof(text), "Could not trim this process (Windows error %lu). It may have exited or be protected.", (unsigned long)error);
+                    MessageBoxA(hwnd, text, "Memory Watchdog", MB_ICONWARNING);
+                }
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            if (LOWORD(wp) == ID_ALERT_END) {
+                if (MessageBoxA(hwnd, "End this process? Unsaved work may be lost.", "Memory Watchdog",
+                                MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) != IDYES) return 0;
+                DWORD error = watch_end(a);
+                if (error) {
+                    char text[160];
+                    snprintf(text, sizeof(text), "Could not end this process (Windows error %lu). It may have exited or be protected.", (unsigned long)error);
+                    MessageBoxA(hwnd, text, "Memory Watchdog", MB_ICONWARNING);
+                }
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            if (LOWORD(wp) == ID_ALERT_IGNORE) {
+                if (SendMessageA(GetDlgItem(hwnd, ID_ALERT_FOREVER), BM_GETCHECK, 0, 0) == BST_CHECKED &&
+                    !watch_ignore_forever(a->name))
+                    MessageBoxA(hwnd, "Could not save the permanent ignore setting.", "Memory Watchdog", MB_ICONWARNING);
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            break;
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_DESTROY:
+            free(a);
+            watch_alert_done();
+            s_alert_window = NULL;
+            PostMessageA(g_hwnd, WM_WATCH_NEXT, 0, 0);
+            return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static void show_next_watch_alert(void) {
+    static BOOL registered;
+    WNDCLASSA wc;
+    WatchAlert *a;
+    RECT work;
+    int x, y;
+    if (s_alert_window || !s_alert_count) return;
+    if (!registered) {
+        ZeroMemory(&wc, sizeof(wc));
+        wc.lpfnWndProc = WatchAlertProc;
+        wc.hInstance = GetModuleHandleA(NULL);
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = "GetMemCleanWatchAlert";
+        if (!RegisterClassA(&wc)) {
+            while (s_alert_count) { free(s_alert_queue[--s_alert_count]); watch_alert_done(); }
+            return;
+        }
+        registered = TRUE;
+    }
+    for (;;) {
+        WatchConfig cfg;
+        if (!s_alert_count) return;
+        a = s_alert_queue[0];
+        memmove(s_alert_queue, s_alert_queue + 1, (--s_alert_count) * sizeof(s_alert_queue[0]));
+        watch_get_config(&cfg);
+        if (cfg.enabled && watch_limit_for(&cfg, a->name)) break;
+        free(a);
+        watch_alert_done();
+    }
+    if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0)) SetRect(&work, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+    x = work.right - 400;
+    y = work.bottom - 260;
+    s_alert_window = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, "GetMemCleanWatchAlert",
+        "Memory Watchdog", WS_POPUP | WS_CAPTION | WS_SYSMENU, x, y, 390, 250,
+        g_hwnd, NULL, GetModuleHandleA(NULL), a);
+    if (s_alert_window) ShowWindow(s_alert_window, SW_SHOWNOACTIVATE);
+    else { free(a); watch_alert_done(); PostMessageA(g_hwnd, WM_WATCH_NEXT, 0, 0); }
 }
 
 // ---------------------------------------------------------------------------
@@ -565,7 +723,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     switch (msg) {
         case WM_TIMER:
-            if (!g_paused) do_clean(FALSE);
+            if (wp == ID_TIMER && !g_paused) do_clean(FALSE);
+            return 0;
+
+        case WM_WATCH_ALERT: {
+            WatchAlert *alert = (WatchAlert *)lp;
+            WatchConfig cfg;
+            watch_get_config(&cfg);
+            if (!cfg.enabled || !watch_limit_for(&cfg, alert->name) || s_alert_count >= 8) {
+                free(alert);
+                watch_alert_done();
+            }
+            else {
+                s_alert_queue[s_alert_count++] = alert;
+                show_next_watch_alert();
+            }
+            return 0;
+        }
+
+        case WM_WATCH_NEXT:
+            show_next_watch_alert();
             return 0;
 
         case WM_TRAY:
@@ -610,6 +787,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_DESTROY:
             KillTimer(hwnd, ID_TIMER);
+            watch_stop();
+            if (s_alert_window) DestroyWindow(s_alert_window);
+            while (s_alert_count) { free(s_alert_queue[--s_alert_count]); watch_alert_done(); }
             Shell_NotifyIconA(NIM_DELETE, &g_nid);
             PostQuitMessage(0);
             return 0;
@@ -635,7 +815,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show) {
     snprintf(g_dir, sizeof(g_dir), "%s", g_exe);
     char *slash = strrchr(g_dir, '\\');
     if (slash) *slash = '\0';
-    snprintf(g_ini, sizeof(g_ini), "%s\\getMemClean.ini", g_dir);
+    if (strlen(g_dir) + sizeof("\\getMemClean.ini") > sizeof(g_ini)) return 1;
+    memcpy(g_ini, g_dir, strlen(g_dir));
+    memcpy(g_ini + strlen(g_dir), "\\getMemClean.ini", sizeof("\\getMemClean.ini"));
 
     // Ensure elevated administrative privileges via UAC prompt if needed
     if (!enable_privilege("SeProfileSingleProcessPrivilege")) {
@@ -654,7 +836,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show) {
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     // Load NtSetSystemInformation dynamically from ntdll.dll
-    NtSet = (NtSetSystemInformation_t)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetSystemInformation");
+    FARPROC nt_proc = GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetSystemInformation");
+    memcpy(&NtSet, &nt_proc, sizeof(NtSet));
     if (NtSet == NULL) {
         MessageBoxA(NULL, "Could not locate NtSetSystemInformation in ntdll.dll.", "getMemClean", MB_ICONERROR);
         return 1;
@@ -662,11 +845,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show) {
 
     BOOL first = (GetFileAttributesA(g_ini) == INVALID_FILE_ATTRIBUTES);
     load_config();
+    watch_init(NULL, g_ini);
     g_autostart = autostart_exists();
 
     // First-time configuration setup
     if (first) {
         save_config();
+        watch_save_config();
         show_settings("getMemClean - First Run Setup");
 
         if (!g_autostart) {
@@ -699,6 +884,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show) {
     set_idle_status();
     add_tray_icon();
     restart_timer();
+    if (!watch_start(g_hwnd))
+        show_notification("Memory Watchdog", "Could not start the monitoring thread.");
 
     // Main Win32 application message loop
     MSG m;
