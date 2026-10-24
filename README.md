@@ -1,65 +1,69 @@
 # getMemClean
 
-**A lightweight, native Windows memory utility written in C.**
-
-getMemClean is a Windows system-tray application that asks the Windows NT memory manager to trim working sets[cite: 1]. It uses native Windows APIs rather than a browser runtime or a large application framework[cite: 1].
-
-The intended everyday setup is **`w` mode only**. Other memory-list operations are available, but they do different things and are not required for the main use case[cite: 1].
-
-> [!IMPORTANT]
-> Memory cleaning is not a universal performance tweak. It does not create RAM, reduce an application's memory allocations, or guarantee higher FPS. Test the effect on your own system and stop using a setting if it causes stutter or worse performance.
+A small C/Win32 system-tray utility for Windows. The existing memory-list cleaning and the optional **Memory Watchdog** operate independently.
 
 ## Features
 
-- **Working-set trimming (`w`)** — the primary operation; can be run manually or on a timer[cite: 1].
-- **Optional memory-list operations** — modified-page and standby-list commands are available for advanced use (`m`, `t`, `0`)[cite: 1].
-- **Automatic cleaning** — set an interval in seconds or disable the timer and clean manually[cite: 1].
-- **RAM-usage threshold** — optionally run a cleaning pass only when reported memory usage reaches a chosen percentage[cite: 1].
-- **System-tray interface** — open Settings, clean immediately, pause or resume automatic cleaning, and exit from the tray menu[cite: 1].
-- **Persistent settings** — configuration is saved in `getMemClean.ini` beside the executable[cite: 1].
-- **Native implementation** — written in C using Windows APIs, including the NT native API used for memory-list commands[cite: 1].
+- Manual or scheduled memory cleaning using the existing `w`, `m`, `t`, and `0` modes.
+- An optional RAM-percentage condition for scheduled cleaning; pause from the tray menu.
+- Memory Watchdog scans processes on a worker thread with Toolhelp and Psapi. It samples Private Bytes and Working Set without pausing the interface.
+- Global Private Bytes limit and optional executable-name overrides. An override takes precedence over the global limit.
+- A bottom-right alert shows the executable name, PID, Private Bytes, Working Set, configured limit, and growth trend. It offers **Trim RAM**, **End process**, and **Ignore**. The Ignore action can permanently exclude the executable name.
+- Before either process action, the Watchdog checks the PID and creation time again. It skips processes Windows marks critical, the utility itself, and inaccessible processes. On older Windows versions without `IsProcessCritical`, it uses a conservative core-process exclusion list.
 
-## Quick start
+The Watchdog is **off by default**. Enable it in Settings. The tray's **Pause auto-cleaning** option affects only scheduled cleaning.
 
-For the main use case, start with `w` mode only. In Settings, choose `w` as the mode and configure the interval to suit your system[cite: 1].
+## What an alert means
 
-To run working-set trimming every five seconds without a RAM-usage threshold, the configuration format is:
+The configured limit applies to **Private Bytes**, not Working Set. Crossing it raises a *high usage* alert. This alone is not evidence of a memory leak. The Watchdog labels *sustained growth* only after three consecutive samples each increase by at least 4 MB and the total increase since tracking began is at least 16 MB. Even then, it is only a signal for investigation, not a diagnosis.
+
+Each process instance gets one high-usage alert and, if observed, one later growth alert. It becomes eligible again after falling below 90% of its limit. PID plus process creation time keeps a new instance from inheriting an old instance's history. Up to eight alerts per scan are queued for display; the rest remain eligible on the next scan.
+
+**Trim RAM** calls the documented `EmptyWorkingSet` API. It can temporarily shrink the Working Set; memory may return and the action does not repair a leak. **End process** always asks for confirmation and warns about unsaved work. The Watchdog never ends processes automatically. Windows access controls may prevent either action.
+
+## Settings
+
+Settings are stored in `getMemClean.ini` beside the executable. The graphical Settings window manages the cleaning and Watchdog options, including per-process limits and permanent exclusions. Executable names are matched without regard to letter case.
+
+```ini
 [getMemClean]
 modes=w
-interval=5
+interval=10
 limit=0
 
-- `modes=w` enables only working-set trimming[cite: 1].
-- `interval=5` requests a cleaning pass every five seconds[cite: 1].
-- `limit=0` disables the RAM-usage threshold, so the interval controls automatic runs[cite: 1].
+[MemoryWatchdog]
+enabled=1
+interval=15
+global_mb=2048
 
-An interval of `0` disables automatic cleaning[cite: 1]. You can also trigger a cleaning pass manually from the tray menu[cite: 1].
+[WatchdogLimits]
+editor.exe=1024
+browser.exe=4096
 
-## Memory modes
+[WatchdogIgnored]
+example.exe=1
+```
 
-| Code | Operation | What it requests |
-| --- | --- | --- |
-| `w` | `MemoryEmptyWorkingSets` | Asks Windows to empty working sets. This is the primary mode[cite: 1]. |
-| `m` | `MemoryFlushModifiedList` | Requests a flush of modified pages[cite: 1]. |
-| `t` | `MemoryPurgeStandbyList` | Purges the standby list[cite: 1]. |
-| `0` | `MemoryPurgeLowPriorityStandbyList` | Purges the low-priority portion of the standby list[cite: 1]. |
+`getMemClean.interval=0` disables scheduled cleaning, while the Watchdog keeps its own timer. `getMemClean.limit=0` disables the cleaning RAM-percentage condition. `MemoryWatchdog.global_mb=0` disables the global process limit, leaving only named limits. The scan interval is 5–3600 seconds. Limits are 1–1048576 MB. An ignored executable name overrides every limit.
 
-## Requirements
+## Build and tests
 
-- Windows[cite: 1]
-- MinGW-w64 GCC to build from source[cite: 1]
+Use MinGW-w64 GCC on Windows:
 
-## Build from source
+```powershell
+gcc -std=c11 -O2 getMemClean.c watchdog.c -o getMemClean.exe -mwindows -lgdi32 -lcomctl32 -lpsapi
+gcc -std=c11 -Wall -Wextra -Werror -O2 tests/watchdog_test.c watchdog.c -o watchdog_test.exe -lpsapi
+./watchdog_test.exe
+```
 
-Compile the application using GCC[cite: 1]:
-gcc getMemClean_tray.c -o getMemClean_tray.exe -mwindows -lgdi32
+If GCC is installed in `C:\msys64\ucrt64\bin`, add that directory to `PATH` before building so `cc1.exe` can find its DLLs:
 
-## Configuration reference
+```powershell
+$env:PATH = 'C:\msys64\ucrt64\bin;' + $env:PATH
+```
 
-Stored in `getMemClean.ini`[cite: 1]:
+The tests cover limit overrides and exclusions, growth detection, alert suppression and rearming, PID reuse, INI persistence, alert text, and failed or stale process actions. A visual check of the notification window and tray behavior still requires an interactive Windows session.
 
-| Setting | Meaning | Default |
-| --- | --- | --- |
-| `modes` | Memory operation codes (`w`, `m`, `t`, `0`)[cite: 1]. | `w`[cite: 1] |
-| `interval` | Automatic-cleaning interval in seconds[cite: 1]. | `10`[cite: 1] |
-| `limit` | Minimum RAM-usage percentage required to clean[cite: 1]. | `0`[cite: 1] |
+## Notes
+
+The existing cleaning engine uses `NtSetSystemInformation`; its effect depends on Windows and can hurt responsiveness in some workloads. Trimming a process's Working Set is also temporary. Per-process rules apply to the executable **name**, so applications with the same name share a rule. Windows may deny process queries or actions for protected processes. No heavy runtime is required beyond the Windows APIs and the MinGW runtime used to build the executable.
